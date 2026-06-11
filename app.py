@@ -8,18 +8,16 @@ from supabase import create_client, Client
 app = FastAPI()
 conexoes = {} # Dicionário: nick -> websocket
 
-# Conexão com o Supabase a partir das variáveis do Render
 url: str = os.environ.get("SUPABASE_URL")
 key: str = os.environ.get("SUPABASE_KEY")
 supabase: Client = create_client(url, key)
 
 def limpar_mensagens_antigas():
-    # Calcula a data de 5 dias atrás e deleta no Supabase
     limite = (datetime.now() - timedelta(days=5)).isoformat()
     try:
         supabase.table("messages").delete().lt("data_hora", limite).execute()
     except Exception as e:
-        print("Erro ao limpar mensagens:", e)
+        pass # Falha silenciosa para não travar o socket
 
 @app.get("/")
 @app.head("/")
@@ -37,51 +35,53 @@ async def chat_endpoint(websocket: WebSocket):
             req = json.loads(data)
             acao = req.get("acao")
 
-            if acao == "registrar":
-                u, s = req["user"], req["senha"]
-                res = supabase.table("users").select("nick").eq("nick", u).execute()
-                if len(res.data) > 0:
-                    await websocket.send_text(json.dumps({"acao": "erro", "msg": "Usuário já existe!"}))
-                else:
-                    supabase.table("users").insert({"nick": u, "senha": s}).execute()
-                    await websocket.send_text(json.dumps({"acao": "sucesso", "msg": "Conta criada! Clique em Entrar."}))
-            
-            elif acao == "login":
+            if acao in ["registrar", "login"]:
                 u, s = req["user"], req["senha"]
                 res = supabase.table("users").select("senha").eq("nick", u).execute()
                 
-                if len(res.data) == 0 or res.data[0]["senha"] != s:
-                    await websocket.send_text(json.dumps({"acao": "erro", "msg": "Usuário ou senha incorretos!"}))
-                else:
-                    user_logado = u
-                    conexoes[u] = websocket
-                    await websocket.send_text(json.dumps({"acao": "login_ok"}))
-                    
-                    limpar_mensagens_antigas()
-                    
-                    # Carrega grupos do usuário
-                    g_res = supabase.table("grupo_membros").select("nome").eq("nick", u).execute()
-                    meus_grupos = list(set([r["nome"] for r in g_res.data]))
-                    for g in meus_grupos:
-                        await websocket.send_text(json.dumps({"acao": "novo_grupo", "nome": g}))
-                    
-                    # Carrega histórico (Últimas 300 mensagens gerais para filtrar localmente e poupar requisições)
-                    alvos_permitidos = ['Global', '@'+u] + meus_grupos
-                    m_res = supabase.table("messages").select("*").order("data_hora", desc=True).limit(300).execute()
-                    hist = []
-                    for row in reversed(m_res.data):
-                        if row["alvo"] in alvos_permitidos or row["de"] == u:
-                            hist.append({"de": row["de"], "alvo": row["alvo"], "texto": row["texto"]})
-                    
-                    await websocket.send_text(json.dumps({"acao": "historico", "msgs": hist}))
-                    await broadcast_online()
+                if acao == "registrar":
+                    if len(res.data) > 0:
+                        await websocket.send_text(json.dumps({"acao": "erro", "msg": "Usuário já existe. Faça login!"}))
+                        continue
+                    else:
+                        # Cria o usuário no Supabase
+                        supabase.table("users").insert({"nick": u, "senha": s}).execute()
+                
+                else: # Lógica de Login
+                    if len(res.data) == 0:
+                        await websocket.send_text(json.dumps({"acao": "erro", "msg": "Usuário não encontrado. Crie a conta!"}))
+                        continue
+                    elif res.data[0]["senha"] != s:
+                        await websocket.send_text(json.dumps({"acao": "erro", "msg": "Senha incorreta!"}))
+                        continue
+                
+                # Se chegou aqui, seja por registro ou login, a autenticação foi um sucesso.
+                user_logado = u
+                conexoes[u] = websocket
+                await websocket.send_text(json.dumps({"acao": "login_ok"}))
+                
+                limpar_mensagens_antigas()
+                
+                # Puxa os grupos
+                g_res = supabase.table("grupo_membros").select("nome").eq("nick", u).execute()
+                meus_grupos = list(set([r["nome"] for r in g_res.data]))
+                for g in meus_grupos:
+                    await websocket.send_text(json.dumps({"acao": "novo_grupo", "nome": g}))
+                
+                # Puxa o histórico
+                alvos_permitidos = ['Global', '@'+u] + meus_grupos
+                m_res = supabase.table("messages").select("*").order("data_hora", desc=True).limit(300).execute()
+                hist = []
+                for row in reversed(m_res.data):
+                    if row["alvo"] in alvos_permitidos or row["de"] == u:
+                        hist.append({"de": row["de"], "alvo": row["alvo"], "texto": row["texto"]})
+                
+                await websocket.send_text(json.dumps({"acao": "historico", "msgs": hist}))
+                await broadcast_online()
 
             elif acao == "enviar" and user_logado:
                 alvo, texto = req["alvo"], req["texto"]
-                
-                # Salva a mensagem no Supabase
                 supabase.table("messages").insert({"de": user_logado, "alvo": alvo, "texto": texto}).execute()
-                
                 msg = {"acao": "msg", "de": user_logado, "alvo": alvo, "texto": texto}
                 msg_json = json.dumps(msg)
                 
@@ -103,8 +103,6 @@ async def chat_endpoint(websocket: WebSocket):
             elif acao == "criar_grupo" and user_logado:
                 nome = "#" + req["nome"].replace(" ", "")
                 membros = list(set(req["membros"] + [user_logado]))
-                
-                # Prepara o lote (batch) de inserts no Supabase
                 inserts = [{"nome": nome, "nick": m} for m in membros]
                 supabase.table("grupo_membros").insert(inserts).execute()
                 
@@ -118,11 +116,9 @@ async def chat_endpoint(websocket: WebSocket):
             await broadcast_online()
 
 async def broadcast_online():
-    # Pega todos os cadastrados no banco
     res = supabase.table("users").select("nick").execute()
     todos = [r["nick"] for r in res.data]
     ativos = list(conexoes.keys())
-    
     msg = json.dumps({"acao": "online", "users": ativos, "todos": todos})
     for ws in conexoes.values():
         await ws.send_text(msg)
